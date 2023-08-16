@@ -43,7 +43,8 @@ Make sure the data is organized as follows (we show an object helmet here):
 
 ## Evaluation with pretrained model
 
-Download the pretrained models [Pretrained Models](https://drive.google.com/file/d/17A0x04nyRc9QLd31R57tWz1tcn159vr2/view?usp=sharing).
+Download the pretrained models [Pretrained Models for reconstruction evaluation](https://drive.google.com/file/d/17A0x04nyRc9QLd31R57tWz1tcn159vr2/view?usp=sharing).
+[Pretrained Models for PSNR evaluation](https://drive.google.com/file/d/1wqFJBv3hAHbBTM49yQZ_Gctm2CV_QVrr/view?usp=sharing)
 
 Run the evaluation script with
 
