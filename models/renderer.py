@@ -237,7 +237,7 @@ class NeuSRenderer:
 
         gradients = sdf_network.gradient(pts).squeeze()
         normals = F.normalize(gradients, dim=-1)
-
+        
         refdirs = 2.0 * torch.sum(normals * -dirs, axis=-1, keepdims=True) * normals + dirs
         sampled_color = color_network(pts, gradients, refdirs, feature_vector).reshape(batch_size, n_samples, 3)
 
@@ -290,7 +290,124 @@ class NeuSRenderer:
         # Normal map
         normals_map = F.normalize(gradients.reshape(batch_size, n_samples, 3), dim=-1)
         normals_map = (normals_map * weights[:, :128, None]).sum(dim=-2).detach().cpu().numpy()
-             
+        
+        # Reflection Score
+        RS = 10. * torch.ones(batch_size, dtype=torch.float32).cuda()
+        if inter_mesh is not None:
+            # __________________________________________________________________________________________________________
+            # _______________________________ Localize surface points with predicted sdf _______________________________
+            # __________________________________________________________________________________________________________
+            sdf_d = sdf.reshape(batch_size, n_samples)
+            prev_sdf, next_sdf = sdf_d[:, :-1], sdf_d[:, 1:]
+            sign = prev_sdf * next_sdf
+
+            surf_exit_inds = torch.unique(torch.where(sign < 0)[0])
+
+            sign = torch.where(sign <= 0, torch.ones_like(sign), torch.zeros_like(sign))
+            idx = reversed(torch.Tensor(range(1, n_samples)).cuda())
+            tmp = torch.einsum("ab,b->ab", (sign, idx))
+            prev_idx = torch.argmax(tmp, 1, keepdim=True)
+            next_idx = prev_idx + 1
+
+            prev_inside_sphere = torch.gather(inside_sphere, 1, prev_idx)
+            next_inside_sphere = torch.gather(inside_sphere, 1, next_idx)
+            mid_inside_sphere = (0.5 * (prev_inside_sphere + next_inside_sphere) > 0.5).float()
+
+            sdf1 = torch.gather(sdf_d, 1, prev_idx)
+            sdf2 = torch.gather(sdf_d, 1, next_idx)
+            z_vals1 = torch.gather(mid_z_vals, 1, prev_idx)
+            z_vals2 = torch.gather(mid_z_vals, 1, next_idx)
+            
+            z_vals_sdf0 = (sdf1 * z_vals2 - sdf2 * z_vals1) / (sdf1 - sdf2 + 1e-10)
+            z_vals_sdf0 = torch.where(z_vals_sdf0 < 0, torch.zeros_like(z_vals_sdf0), z_vals_sdf0)
+            max_z_val = torch.max(z_vals)
+            z_vals_sdf0 = torch.where(z_vals_sdf0 > max_z_val, torch.zeros_like(z_vals_sdf0), z_vals_sdf0)
+            points_for_warp = (rays_o[:, None, :] + rays_d[:, None, :] * z_vals_sdf0[..., :, None]).detach()
+
+            # __________________________________________________________________________________________________________
+            # _________________________________________ Occlusion Detection ____________________________________________
+            # __________________________________________________________________________________________________________        
+            ref_point_dir = torch.cat((rays_o, rays_d), dim=-1).cpu().numpy()
+            ref_point_dir = o3d.core.Tensor(ref_point_dir, dtype=o3d.core.Dtype.Float32)
+
+            ans_ref = inter_mesh.cast_rays(ref_point_dir)
+            t_hit_ref = torch.from_numpy(ans_ref['t_hit'].numpy()).cuda().squeeze(0)
+            
+            # inf means the ray dose not hit the surface
+            val_ray_inds = torch.where(~torch.isinf(t_hit_ref))[0]
+            tmp = list(set(val_ray_inds.cpu().numpy()) & set(surf_exit_inds.cpu().numpy())) # double check: sdf network and mesh
+            val_ray_inside_inds = torch.tensor(tmp).cuda()
+            
+            if val_ray_inside_inds.shape[0] != 0:
+                
+                # get source rays_o 
+                rays_o_src = dataset.all_rays_o.cuda()[scr_ind]
+                # get all rays_d for all validate point 
+                rays_d_scr = points_for_warp - rays_o_src
+                rays_d_scr = F.normalize(rays_d_scr, dim=-1)
+               
+                rays_o_src = rays_o_src.expand(rays_d_scr.size())
+
+                points_for_warp = points_for_warp[val_ray_inside_inds]
+
+                #cal source
+                val_rays_o_scr = rays_o_src[val_ray_inside_inds]
+                val_rays_d_scr = rays_d_scr[val_ray_inside_inds]
+
+                all_point_dir = torch.cat((val_rays_o_scr, val_rays_d_scr),dim=-1).cpu().numpy()
+                all_point_dir = o3d.core.Tensor(all_point_dir, dtype=o3d.core.Dtype.Float32)
+                ans_source = inter_mesh.cast_rays(all_point_dir)
+                
+                t_hit_src = torch.from_numpy(ans_source['t_hit'].numpy()).cuda()
+                t_hit_src[torch.where(torch.isinf(t_hit_src))] = -10.
+
+                # distance from surface points to source rays_o 
+                dist = ((points_for_warp.repeat(1, len(scr_ind), 1) - val_rays_o_scr) / val_rays_d_scr)[..., 0]
+                # we slightly relax the occlusion judegment. If the surfaces are optimized inward, all source views are occluded. 
+                dist_ref = ((points_for_warp.squeeze(1) - rays_o[val_ray_inside_inds]) / rays_o[val_ray_inside_inds])[..., 0].detach()
+                diff_ref = (dist_ref - t_hit_ref[val_ray_inside_inds]).detach()
+            
+                diff_ref[torch.where(torch.isinf(diff_ref))] = 0.
+                diff_ref[torch.where(diff_ref < 0 )] = 0.
+    
+                val_inds = torch.where(( (dist - 1.5 * diff_ref[:,None].repeat(1, rays_d_scr.shape[1]) - 0.05) <= t_hit_src))
+                all_val_inds = torch.zeros(val_rays_d_scr.shape[:2], dtype=torch.int64).cuda()
+                all_val_inds[val_inds] = 1
+               
+                with torch.no_grad():
+                    grid_px, in_front = project(points_for_warp.view(-1, 3), inv_src_pose[:, :3].cuda(), src_intr[:, :3, :3].cuda())
+                    grid_px[..., 0], grid_px[..., 1] = grid_px[..., 1].clone(), grid_px[..., 0].clone()
+
+                    grid = normalize(grid_px.squeeze(0), dataset.H, dataset.W, clamp=10)
+                    warping_mask_full = (in_front.squeeze(0) & (grid < 1).all(dim=-1) & (grid > -1).all(dim=-1))
+
+                    sampled_rgb_vals = F.grid_sample(dataset.images[scr_ind].squeeze(0).permute(0, 3, 2, 1), grid.unsqueeze(1), align_corners=True).squeeze(2).transpose(1, 2)
+                    sampled_rgb_vals[~warping_mask_full, :] = 0  #[num_scr, num_val_rays, 3]
+                    all_rgbs_warp = sampled_rgb_vals.transpose(0, 1) #[num_val_rays, num_scr, 3]
+
+                    bk_ind = torch.all(all_rgbs_warp == 0, dim=2) 
+                    all_val_inds_fina = all_val_inds * warping_mask_full.transpose(0,1) * ~bk_ind
+                    
+                    num_val = torch.sum(all_val_inds_fina, dim=-1) 
+                    bk_num = torch.sum(bk_ind * all_val_inds * warping_mask_full.transpose(0,  1), dim=-1)
+                    _val_ind = torch.where((num_val>=5) & (bk_num <= 10))
+        
+                    # here we use L1 distance, which achieves similar results
+                    RS_temp = 10. * torch.ones((val_ray_inside_inds.shape[0])).cuda()
+                    uv_val = uv[val_ray_inside_inds]
+    
+                    anchor_rgb = dataset.images[ref_idx][(uv_val[:,0].long(), uv_val[:,1].long())].view(-1, 3).cuda()
+                    diff_color = torch.zeros_like(all_rgbs_warp).cuda()
+                    all_warp_color = torch.zeros_like(all_rgbs_warp).cuda()
+                    
+                    diff_color[all_val_inds_fina.bool()] = torch.abs(all_rgbs_warp - anchor_rgb[:, None, :].expand(all_rgbs_warp.size()))[all_val_inds_fina.bool()]
+                    all_warp_color[all_val_inds_fina.bool()] = torch.abs(all_rgbs_warp - anchor_rgb[:, None, :].expand(all_rgbs_warp.size()))[all_val_inds_fina.bool()]
+                    val_mean = torch.sum(all_warp_color, dim=-2) / num_val.unsqueeze(-1)
+                        
+                    RS_temp[_val_ind] = (val_mean.sum(-1)[_val_ind] * 10.).clamp(min=1., max=5.)
+        
+                    RS[val_ray_inside_inds] = RS_temp
+                    
         return {
             'color': color,
             'sdf': sdf,
@@ -302,6 +419,7 @@ class NeuSRenderer:
             'cdf': c.reshape(batch_size, n_samples),
             'gradient_error': gradient_error,
             'inside_sphere': inside_sphere,
+            'RS': RS,
             'normal_map': normals_map,
         }
 
@@ -401,6 +519,7 @@ class NeuSRenderer:
             'weights': weights,
             'gradient_error': ret_fine['gradient_error'],
             'inside_sphere': ret_fine['inside_sphere'],
+            'RS': ret_fine['RS'],
             'normal_map': ret_fine['normal_map'],
         }
 
