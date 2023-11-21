@@ -82,9 +82,6 @@ class Runner:
         
         # Intermediate Mesh 
         self.scene = None
-        
-        # Write evaluation metric
-        self.result = open(os.path.join(self.base_exp_dir, 'result.txt'), 'a')
 
         # Load checkpoint
         latest_model_name = None
@@ -130,7 +127,7 @@ class Runner:
             mask_sum = mask.sum() + 1e-5
             
             if self.iter_step % self.val_mesh_freq == 0:
-                self.scene = self.validate_mesh(self.result, resolution=128)
+                self.scene = self.validate_mesh(resolution=128)
 
             if self.iter_step % self.val_freq == 0:
                 self.validate_image()
@@ -145,10 +142,11 @@ class Runner:
             gradient_error = render_out['gradient_error']
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
+            RS = render_out['RS'].unsqueeze(-1)
 
             # Loss
             color_error = (color_fine - true_rgb) * mask
-            color_fine_loss = (F.l1_loss(color_error, torch.zeros_like(color_error), reduction='none')).sum() / mask_sum
+            color_fine_loss = (F.l1_loss(color_error, torch.zeros_like(color_error), reduction='none') / RS).sum() / mask_sum
             psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
 
             eikonal_loss = gradient_error
@@ -274,6 +272,7 @@ class Runner:
         
         out_rgb_fine = []
         out_normal_fine = []
+        RS_fine = []
 
         for rays_o_batch, rays_d_batch, uv_batch in zip(rays_o, rays_d, uv):
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
@@ -297,6 +296,9 @@ class Runner:
             if feasible('gradients') and feasible('weights'):
                 normals = render_out['normal_map']
                 out_normal_fine.append(normals)
+            if feasible('RS'):
+                RS = render_out['RS'][:, None].expand(render_out['RS'].shape[0], 3).cpu().numpy()
+                RS_fine.append(1. / RS)
             del render_out
             
         normal_img = None
@@ -307,17 +309,28 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'normals_all'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'test_images_all'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
+        os.makedirs(os.path.join(self.base_exp_dir, 'RS_all'), exist_ok=True)
+        os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
+        
         torchvision.utils.save_image(normal_img.clone(), os.path.join(self.base_exp_dir, 'normals', '{:0>8d}_0_{}.png'.format(self.iter_step, idx)), nrow=8)
         img_fine = None
         if len(out_rgb_fine) > 0:
             img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
+        if len(RS_fine) > 0:
+            RS_fine = (np.concatenate(RS_fine, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
             
         if only_normals:
             torchvision.utils.save_image(normal_img.clone(), os.path.join(self.base_exp_dir, 'normals_all', '{:0>8d}_0_{}.png'.format(self.iter_step, idx)), nrow=8)
             cv.imwrite(os.path.join(self.base_exp_dir, 'test_images_all', '{:0>8d}_0_{}.png'.format(self.iter_step, idx)), img_fine[..., 0])
             normal_img[0,:,:], normal_img[2,:,:] = normal_img[2,:,:].clone(), normal_img[0,:,:].clone()
+            cv.imwrite(os.path.join(self.base_exp_dir, 'RS_all', '{:0>8d}_0_{}.png'.format(self.iter_step, idx)), RS_fine[..., 0])
             return normal_img.permute(1,2,0) * 256., torch.from_numpy(img_fine[..., 0] / 256.)
         
+        
+
+        os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
+
+
 
         os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
 
@@ -326,7 +339,7 @@ class Runner:
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'validations_fine',
                                         '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
-                           np.concatenate([img_fine[..., i],
+                           np.concatenate([img_fine[..., i], RS_fine[..., i],
                                            self.dataset.image_at(idx, resolution_level=resolution_level)]))
         if pose is not None:
             img_fine = torch.from_numpy(img_fine[..., 0])
@@ -361,7 +374,7 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
         return img_fine
 
-    def validate_mesh(self, result, resolution=64, threshold=0.0, ckpt_path=None, validate_normal=False):
+    def validate_mesh(self, resolution=64, threshold=0.0, ckpt_path=None):
         if ckpt_path is not None:
             self.load_ckpt_validation(ckpt_path)
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
@@ -380,7 +393,7 @@ class Runner:
         scene = o3d.t.geometry.RaycastingScene()
         cube_id = scene.add_triangles(mesh_)
         
-        if self.iter_step % 10000 == 0 and self.iter_step != 0: 
+        if self.iter_step == self.end_iter - 1:
             resolution = 512
 
             vertices, triangles =\
@@ -388,29 +401,10 @@ class Runner:
             os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
             
             mesh = trimesh.Trimesh(vertices, triangles)
-            mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.ply'.format(self.iter_step)))
-
             mesh.apply_transform(self.dataset.scale_mat)  #transform to orignial space for evaluation
             mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}_eval.ply'.format(self.iter_step)))
-            mesh_eval = o3d.io.read_triangle_mesh(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}_eval.ply'.format(self.iter_step)))
-            with open(os.path.join(self.conf['dataset'].data_dir, 'test_info.json'), 'r') as f:
-                text_info = json.load(f)
-            points_for_plane = text_info['points']
-            max_dist_d = text_info['max_dist_d']
-            max_dist_t = text_info['max_dist_t']
-            try:
-                nonvalid_bbox = text_info['nonvalid_bbox']
-            except:
-                nonvalid_bbox = None
-            mean_d2s, mean_s2d, over_all = evaluation_shinyblender(mesh_eval, os.path.join(self.conf['dataset'].data_dir, 'dense_pcd.ply'),self.base_exp_dir, 
-                                                                   max_dist_d=max_dist_d, max_dist_t=max_dist_t, points_for_plane=points_for_plane, nonvalid_bbox=nonvalid_bbox )
-
-            result.write(f'{self.iter_step}: ')
-            result.write(f'{mean_d2s} {mean_s2d} {over_all}')
-            result.write('\n') 
-            result.flush()
-            if self.iter_step == self.end_iter - 1 or ckpt_path is not None and validate_normal:
-                self.validate_all_normals()
+            
+            #self.validate_all_normals(ckpt_path)
 
         logging.info('End')
         return scene
@@ -440,7 +434,10 @@ class Runner:
 
         writer.release()
 
-    def validate_all_normals(self):
+    def validate_all_normals(self, ckpt_path):
+        if ckpt_path is not None:
+            self.load_ckpt_validation(ckpt_path)
+        #self.scene = self.validate_mesh(self.result, resolution=128)
         total_MAE = 0
         total_PNSR = 0
         idxs = [i for i in range(self.dataset.n_images)]
@@ -506,7 +503,6 @@ if __name__ == '__main__':
     parser.add_argument('--is_continue', default=False, action="store_true")
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--ckpt_path', type=str, default='')
-    parser.add_argument('--validate_normal', default=False, action="store_true")
 
     args = parser.parse_args()
 
@@ -516,9 +512,11 @@ if __name__ == '__main__':
     if args.mode == 'train':
         runner.train()
     elif args.mode == 'validate_mesh':
-        runner.validate_mesh(runner.result, resolution=512, threshold=args.mcube_threshold, ckpt_path=args.ckpt_path, validate_normal=args.validate_normal)
+        runner.validate_mesh(runner.result, resolution=512, threshold=args.mcube_threshold, ckpt_path=args.ckpt_path)
     elif args.mode == 'visualize_video':
         runner.visualize(ckpt_path=args.ckpt_path)
+    elif args.mode == 'validate_normal':
+        runner.validate_all_normals(ckpt_path=args.ckpt_path)
     elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
         _, img_idx_0, img_idx_1 = args.mode.split('_')
         img_idx_0 = int(img_idx_0)
