@@ -70,7 +70,9 @@ The output videos will be in ```base_exp_dir/normals.mp4``` and ```base_exp_dir/
 
 ## Train a model from scratch
 
-We wiil release the training code soon.
+Run the evaluation script with
+
+```python exp_runner.py --mode train --conf ./confs/womask.conf ```
 
 ## Citation
 
