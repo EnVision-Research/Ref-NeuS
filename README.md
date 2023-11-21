@@ -1,6 +1,6 @@
 
 
-# Ref-NeuS: Ambiguity-Reduced Neural Implicit Surface Learning for Multi-View Reconstruction with Reflection (ICCV, Oral, Acceptance Rate: 2.36%)
+# Ref-NeuS: Ambiguity-Reduced Neural Implicit Surface Learning for Multi-View Reconstruction with Reflection (ICCV, Oral, Best Paper Nomination. Top 0.2%)
 
 ## [Project Page](https://g3956.github.io/) |  [Paper](https://arxiv.org/pdf/2303.10840.pdf)
 
